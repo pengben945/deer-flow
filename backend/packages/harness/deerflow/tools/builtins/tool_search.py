@@ -54,9 +54,14 @@ class DeferredToolRegistry:
     def promote(self, names: set[str]) -> None:
         """Remove tools from the deferred registry so they pass through the filter.
 
-        Called after tool_search returns a tool's schema — the LLM now knows
-        the full definition, so the DeferredToolFilterMiddleware should stop
-        stripping it from bind_tools on subsequent calls.
+        在 tool_search 返回工具的 schema 后被调用——LLM 现在知道了
+        完整的定义，DeferredToolFilterMiddleware 应停止在后续调用中
+        将其从 bind_tools 中剥离。
+
+        为什么是单向的：一旦被提升，该工具在此次 agent 运行期间
+        保持活跃。没有"降级"操作，因为 LLM 的上下文窗口已经包含了
+        该 schema——再次隐藏它会导致模型尝试调用时失败返回
+        "not a valid tool"。
         """
         if not names:
             return
@@ -141,6 +146,12 @@ def _regex_score(pattern: str, entry: DeferredToolEntry) -> int:
 # independent registry value.  For synchronous tools run via
 # loop.run_in_executor, Python copies the current context to the worker thread,
 # so the ContextVar value is correctly inherited there too.
+#
+# 为什么用 ContextVar 而不是线程局部变量：LangGraph 是异步优先的——
+# 单个线程可以通过 asyncio 复用数百个并发运行。threading.local()
+# 会让同一个线程上的所有协程共享相同的 registry。
+# ContextVar 遵循 asyncio 上下文边界，为每次运行提供隔离，
+# 且没有显式请求 ID 映射的开销。
 
 _registry_var: contextvars.ContextVar[DeferredToolRegistry | None] = contextvars.ContextVar("deferred_tool_registry", default=None)
 

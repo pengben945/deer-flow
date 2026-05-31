@@ -1236,6 +1236,13 @@ def bash_tool(runtime: ToolRuntime[ContextT, ThreadState], description: str, com
     try:
         sandbox = ensure_sandbox_initialized(runtime)
         if is_local_sandbox(runtime):
+            # 安全校验链（5 步）：
+            # 1. is_host_bash_allowed — 全局开关，除非显式启用否则拒绝
+            # 2. ensure_thread_directories_exist — 创建工作区/上传/输出目录
+            # 3. validate_local_bash_command_paths — 拒绝路径穿越、拒绝
+            #    /mnt/user-data、/mnt/skills、/mnt/acp-workspace 之外的绝对路径
+            # 4. replace_virtual_paths_in_command — 将虚拟路径翻译为宿主机路径
+            # 5. _apply_cwd_prefix — cd 到线程工作区，使相对路径可运行
             if not is_host_bash_allowed():
                 return f"Error: {LOCAL_HOST_BASH_DISABLED_MESSAGE}"
             ensure_thread_directories_exist(runtime)

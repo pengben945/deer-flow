@@ -39,6 +39,24 @@ def resolve_variable[T](
     Raises:
         ImportError: If the module path is invalid or the attribute doesn't exist.
         ValueError: If the resolved variable doesn't pass the validation checks.
+
+    工作方式（三步）：
+      1. 在最后一个 ``:`` 处切分 ``variable_path`` → (module_path, variable_name)
+      2. ``importlib.import_module(module_path)`` → 模块对象
+      3. ``getattr(module, variable_name)`` → 加载后的工具/模型/类
+
+    为什么用这个模式：整个工具、模型和沙箱提供者的加载链都依赖于
+    ``resolve_variable``。在 config.yaml 中写入 ``use: deerflow.sandbox.
+    tools:bash_tool`` 意味着 DeerFlow 无需在导入时就知道存在哪些工具——
+    用户可以通过在配置中声明导入路径来添加第三方工具。
+    ``expected_type`` 验证能尽早捕获配置错误（例如将 ``tools[].use``
+    指向字符串而非 ``BaseTool`` 实例）。
+
+    边界案例：
+    - 路径中没有 ``:`` → rsplit(maxsplit=1) 抛出 ValueError，
+      被重新提升为带有帮助信息的 ImportError。
+    - 模块本身导入成功但传递依赖缺失 → 保留 Python 原始的 ImportError，
+      如果根模块匹配已知的第三方包，则附加安装提示。
     """
     try:
         module_path, variable_name = variable_path.rsplit(":", 1)

@@ -190,6 +190,13 @@ def _assemble_from_features(
     extra_tools: list[BaseTool] = []
 
     # --- [0-2] Sandbox infrastructure ---
+    #
+    # 为什么用三个 middleware 而不是一个：每个有独立的生命周期职责。
+    # ThreadDataMiddleware 创建线程隔离目录（在沙箱启动之前）。
+    # UploadsMiddleware 将已上传文件引用解析到 state 中。
+    # SandboxMiddleware 获取/释放沙箱（本地文件系统或 Docker）。
+    # 延迟初始化意味着 middleware 在首次使用时才设置状态，
+    # 而不是在图构建时就完成。
     if feat.sandbox is not False:
         if isinstance(feat.sandbox, AgentMiddleware):
             chain.append(feat.sandbox)
@@ -278,6 +285,12 @@ def _assemble_from_features(
     chain.append(LoopDetectionMiddleware())
 
     # --- [13] Clarification (always last among built-ins) ---
+    #
+    # 为什么必须最后：ClarificationMiddleware 拦截 ask_clarification 工具调用，
+    # 并发出 Command(goto=END)，这会短路 agent 图，将控制权返回给用户。
+    # 如果另一个 middleware 在它之后运行，该 middleware 在澄清轮次中
+    # 将永远无法被执行，造成不变量违例。该不变量在下方插入
+    # extra_middleware 时得到保障。
     chain.append(ClarificationMiddleware())
     extra_tools.append(ask_clarification_tool)
 
@@ -307,6 +320,12 @@ def _insert_extra(chain: list[AgentMiddleware], extras: list[AgentMiddleware]) -
       3. Insert unanchored extras before ClarificationMiddleware.
       4. Insert anchored extras iteratively (supports cross-external anchoring).
       5. If an anchor cannot be resolved after all rounds → error.
+
+    为什么需要迭代锚定：额外 middleware A 可能锚定在额外 middleware B 上
+    （"把我插入到 @Next(B)"）。由于 A 和 B都是待插入的，处理 A 时 B
+    可能尚未在链中。迭代循环最多重试 ``len(pending) + 1`` 轮，
+    让锚定在其他额外组件上的工具在其目标被放置后得以解析。
+    循环依赖检测捕获 A @Next(B) + B @Next(A) 的情况。
     """
     next_targets: dict[type, type] = {}
     prev_targets: dict[type, type] = {}

@@ -256,6 +256,21 @@ def _build_middlewares(
     resolved_app_config = app_config or get_app_config()
     middlewares = build_lead_runtime_middlewares(app_config=resolved_app_config, lazy_init=True)
 
+    # 为什么按这个顺序追加：
+    # Middleware 管道顺序是 *model → after_model → after_tools → after_agent*。
+    # 沙箱基础设施（ThreadData→Uploads→Sandbox）必须排在首位，
+    # 确保线程目录和沙箱在任何工具运行之前就绪。
+    # Summarization 早期运行，在模型调用前缩减上下文成本。
+    # TodoList（plan_mode）在 summarization 之后、memory 归档之前
+    # 跟踪进度，使待办状态在内存更新中可见。
+    # TitleMiddleware 从第一次对话生成线程标题。
+    # MemoryMiddleware 在标题生成后归档对话。
+    # ViewImageMiddleware 在 LLM 调用前注入图片数据。
+    # DeferredToolFilterMiddleware 从 bind_tools 中剥离延迟加载的 MCP schema。
+    # SubagentLimitMiddleware 在模型输出后限制并发任务数。
+    # LoopDetectionMiddleware 捕获重复的工具调用模式。
+    # ClarificationMiddleware 必须排在末尾——它可能短路整个图。
+
     # Add summarization middleware if enabled
     summarization_middleware = _create_summarization_middleware(app_config=resolved_app_config)
     if summarization_middleware is not None:
@@ -377,6 +392,13 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
 
     if is_bootstrap:
         # Special bootstrap agent with minimal prompt for initial custom agent creation flow
+        #
+        # 为什么需要独立路径：bootstrap agent 在任何自定义 agent 存在之前运行——
+        # 没有 agent_name、agent_config 或技能的配置。它使用精简的 prompt
+        # （仅核心指令 + bootstrap 技能）和一个额外的工具（setup_agent），
+        # 该工具负责持久化新 agent 的 SOUL.md + config.yaml。
+        # 一旦自定义 agent 创建完成，后续运行将走下面的正常路径，
+        # 加载该 agent 的配置。
         return create_agent(
             model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, app_config=resolved_app_config),
             tools=get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled, app_config=resolved_app_config) + [setup_agent],

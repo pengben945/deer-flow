@@ -23,7 +23,13 @@ SUBAGENT_TOOLS = [
 
 
 def _is_host_bash_tool(tool: object) -> bool:
-    """Return True if the tool config represents a host-bash execution surface."""
+    """如果工具配置代表一个宿主机的 bash 执行面，返回 True。
+
+    为什么：在本地沙箱模式下，宿主机的文件系统是直接可访问的。
+    暴露 bash 工具会让 agent 在宿主机上执行任意命令，破坏沙箱隔离。
+    我们同时检查 ``group=="bash"``（命名约定）和具体的 ``use`` 路径（实际实现），
+    因为用户可能在自定义工具组下定义 bash 工具。
+    """
     group = getattr(tool, "group", None)
     use = getattr(tool, "use", None)
     if group == "bash":
@@ -62,6 +68,12 @@ def get_available_tools(
     if not is_host_bash_allowed(config):
         tool_configs = [tool for tool in tool_configs if not _is_host_bash_tool(tool)]
 
+    # 为什么用 resolve_variable：Config 工具以点分路径声明（例如
+    # "deerflow.community.tavily.tools:web_search_tool"），用户无需接触
+    # import 链即可添加工具。resolve_variable 在运行时动态导入模块，
+    # 并验证结果是否为 BaseTool 子类。
+    # 边界案例：如果 cfg.name != loaded.name，LLM 在 schema 中看到的是
+    # 一个名称，但运行时识别的是另一个名称（问题 #1803）。
     loaded_tools_raw = [(cfg, resolve_variable(cfg.use, BaseTool)) for cfg in tool_configs]
 
     # Warn when the config ``name`` field and the tool object's ``.name``
@@ -109,6 +121,11 @@ def get_available_tools(
     # reflected when loading MCP tools.
     mcp_tools = []
     # Reset deferred registry upfront to prevent stale state from previous calls
+    #
+    # 为什么在这里重置：当 agent 被重新创建时（例如 MCP 配置变更后），
+    # get_available_tools 会被再次调用。如果不重置，上一次调用遗留的旧 registry
+    # 会作为 ContextVar 值存活在当前 asyncio 上下文中，导致 tool_search
+    # 返回过期的工具引用。
     reset_deferred_registry()
     if include_mcp:
         try:
@@ -123,6 +140,14 @@ def get_available_tools(
 
                     # When tool_search is enabled, register MCP tools in the
                     # deferred registry and add tool_search to builtin tools.
+                    #
+                    # 为什么：MCP 服务器可能暴露数百个工具。每轮对话都将
+                    # 所有 schema 发送给 LLM 会消耗大量 Token，甚至超出上下文限制。
+                    # 延迟注册表只存储工具元数据（名称 + 描述），只有当 LLM
+                    # 通过 tool_search 显式获取时，才将一个工具提升到活跃 schema 列表。
+                    #
+                    # 这里发生了两次注册：1）注册到 DeferredToolRegistry 用于搜索；
+                    # 2）DeferredToolFilterMiddleware 从 bind_tools 中剥离延迟加载的 schema。
                     if config.tool_search.enabled:
                         from deerflow.tools.builtins.tool_search import DeferredToolRegistry, set_deferred_registry
                         from deerflow.tools.builtins.tool_search import tool_search as tool_search_tool
@@ -160,6 +185,13 @@ def get_available_tools(
     # Deduplicate by tool name — config-loaded tools take priority, followed by
     # built-ins, MCP tools, and ACP tools.  Duplicate names cause the LLM to
     # receive ambiguous or concatenated function schemas (issue #1803).
+    #
+    # 为什么是这个顺序：Config 工具由部署者精心挑选，应始终优先。
+    # Builtin 工具是核心平台能力。MCP 工具是从外部服务器加载的插件，
+    # 最可能产生意料之外的命名冲突。ACP 工具是外部 agent 的包装，
+    # 优先级最低。
+    # 边界案例：如果两个 config 工具同名，第一个 config 条目静默获胜。
+    # 用户应确保在其配置中工具名唯一。
     all_tools = loaded_tools + builtin_tools + mcp_tools + acp_tools
     seen_names: set[str] = set()
     unique_tools: list[BaseTool] = []

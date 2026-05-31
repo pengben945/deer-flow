@@ -373,6 +373,14 @@ def get_app_config() -> AppConfig:
     resolved_path = AppConfig.resolve_config_path()
     current_mtime = _get_config_mtime(resolved_path)
 
+    # 三种触发条件下的自动重载：
+    #   (a) 首次调用（_app_config 为 None）
+    #   (b) 配置路径变更（调用间 DEER_FLOW_CONFIG_PATH 环境变量改变）
+    #   (c) 文件 mtime 变更（用户在磁盘上编辑了 config.yaml）
+    # 条件 (c) 是热重载路径：LangGraph Server 与 Gateway 运行在同一个
+    # 进程中，因此当 Gateway 的 PUT /api/mcp 写入 extensions_config.json
+    # 时，下一次工具加载调用就能感知到变更。
+    # 比较使用秒级精度的 mtime；详见 _is_cache_stale。
     should_reload = _app_config is None or _app_config_path != resolved_path or _app_config_mtime != current_mtime
     if should_reload:
         if _app_config_path == resolved_path and _app_config_mtime is not None and current_mtime is not None and _app_config_mtime != current_mtime:
