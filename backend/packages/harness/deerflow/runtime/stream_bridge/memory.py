@@ -1,5 +1,20 @@
 """In-memory stream bridge backed by an in-process event log."""
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ 【Runtime - MemoryStreamBridge】 内存事件管道（Producer-Consumer 模式）       ║
+# ║                                                                              ║
+# ║ 核心数据结构: _RunStream (events list + asyncio.Condition + ended flag)       ║
+# ║                                                                              ║
+# ║ 生产者 (Worker): publish() → 追加事件到列表，notify_all() 通知消费者           ║
+# ║ 消费者 (SSE):    subscribe() → await condition.wait() 阻塞等待新事件          ║
+# ║                                                                              ║
+# ║ 设计特性:                                                                     ║
+# ║   - 事件缓冲区上限 256 条，超出时丢弃最早的事件                                 ║
+# ║   - Last-Event-ID 支持断线重连                                               ║
+# ║   - 15s 心跳机制 (asyncio.wait_for + TIMEOUT)                                ║
+# ║   - 延迟清理 (cleanup delay=60s) 给迟到的 subscriber 机会                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
 from __future__ import annotations
 
 import asyncio
@@ -66,6 +81,8 @@ class MemoryStreamBridge(StreamBridge):
     # -- StreamBridge API ------------------------------------------------------
 
     async def publish(self, run_id: str, event: str, data: Any) -> None:
+        # 生产者: 追加事件 + 通知消费者 (asyncio.Condition.notify_all)
+        # 事件 ID 格式: {timestamp_ms}-{seq}，支持 Last-Event-ID 定位
         stream = self._get_or_create_stream(run_id)
         entry = StreamEvent(id=self._next_id(run_id), event=event, data=data)
         async with stream.condition:
@@ -82,6 +99,13 @@ class MemoryStreamBridge(StreamBridge):
             stream.ended = True
             stream.condition.notify_all()
 
+    # (学习注释) ★ subscribe — 消费者端 Async Iterator
+    # 核心机制: asyncio.Condition.wait() 在没有新事件时阻塞等待
+    # 三种唤醒场景:
+    #   1. 生产者 notify_all() → 有新事件，正常 yield
+    #   2. TimeoutError (15s 无新事件) → yield HEARTBEAT_SENTINEL
+    #   3. stream.ended=True → yield END_SENTINEL 并 return
+    # Last-Event-ID 支持: 从已读事件之后继续，不重复发送
     async def subscribe(
         self,
         run_id: str,

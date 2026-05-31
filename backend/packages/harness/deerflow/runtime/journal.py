@@ -15,6 +15,21 @@ Key design decisions:
 - Caller identification via tags injection (lead_agent / subagent:{name} / middleware:{name})
 """
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ 【Runtime - RunJournal】 LangChain 回调 → 事件持久化                           ║
+# ║                                                                              ║
+# ║ 架构位置: 作为 BaseCallbackHandler 注入到 agent 的 callbacks                   ║
+# ║                                                                              ║
+# ║ 核心回调:                                                                     ║
+# ║   on_chat_model_start → 捕获 LLM 请求 + 提取首条 HumanMessage                  ║
+# ║   on_llm_end          → 捕获 LLM 响应 + 累加 token 用量                        ║
+# ║   on_chain_start/end  → 追踪执行生命周期                                       ║
+# ║   on_tool_start/end   → 捕获工具调用结果                                       ║
+# ║                                                                              ║
+# ║ 面试重点: BaseCallbackHandler 方法是同步的，flush 需通过                           ║
+# ║ asyncio.get_running_loop() 调度异步刷入; 无事件循环时留在缓冲区等 finally 块     ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +49,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# (学习注释) RunJournal 作为 LangChain BaseCallbackHandler,
+# 它"监听"整个 agent 执行过程中的所有 LLM 调用、工具执行、异常事件，
+# 并将这些事件标准化后写入 RunEventStore。
+# 不实现 on_llm_new_token（不逐 token 记录），只通过 on_llm_end 记录完整消息。
 class RunJournal(BaseCallbackHandler):
     """LangChain callback handler that captures events to RunEventStore."""
 
@@ -272,6 +291,12 @@ class RunJournal(BaseCallbackHandler):
         if len(self._buffer) >= self._flush_threshold:
             self._flush_sync()
 
+    # (学习注释) _flush_sync: 同步回调中的异步刷盘
+    # BaseCallbackHandler 回调方法是同步的(Sync)，但写数据库是异步的(Async)。
+    # 技巧: 通过 asyncio.get_running_loop() 判断是否在事件循环中，
+    # 如果是 → loop.create_task() 调度异步写入；
+    # 如果不是(后台线程) → 事件留在缓冲区，等 finally 块的 async flush() 处理。
+    # 同时防止并发刷盘: 如果已有 pending_flush_tasks 则跳过。
     def _flush_sync(self) -> None:
         """Best-effort flush of buffer to RunEventStore.
 

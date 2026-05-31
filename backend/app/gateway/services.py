@@ -7,6 +7,12 @@ frames, and consuming stream bridge events.  Router modules
 
 from __future__ import annotations
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ 【Layer 2 - Service 服务层】Run 生命周期核心业务逻辑                         ║
+# ║ 架构位置: API Router → Service → Runtime                                      ║
+# ║ start_run — 核心工厂函数: 创建 Run + 构建配置 + asyncio.create_task(run_agent)  ║
+# ║ sse_consumer — SSE Async Generator: bridge.subscribe() → format_sse() → yield  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 import asyncio
 import json
 import logging
@@ -35,6 +41,12 @@ from deerflow.runtime import (
 logger = logging.getLogger(__name__)
 
 
+# ==============================================================================
+# (学习注释) SSE 协议格式: event:<名>  data:<JSON>  id:<序号>  空行 空行
+# 字段顺序必须为 event → data → id，LangGraph SDK 解码器顺序依赖于此
+# ==============================================================================
+
+
 # ---------------------------------------------------------------------------
 # SSE formatting
 # ---------------------------------------------------------------------------
@@ -54,6 +66,12 @@ def format_sse(event: str, data: Any, *, event_id: str | None = None) -> str:
     parts.append("")
     parts.append("")
     return "\n".join(parts)
+
+
+# ==============================================================================
+# (学习注释) 输入/配置辅助函数 — HTTP 请求参数 → LangChain/LangGraph 内部格式
+# 核心思路: 兼容 LangGraph Platform 协议 + 扩展 DeerFlow 自定义配置
+# ==============================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +116,11 @@ def normalize_input(raw_input: dict[str, Any] | None) -> dict[str, Any]:
 _DEFAULT_ASSISTANT_ID = "lead_agent"
 
 
+# (学习注释) ★ 面试重点: 以下白名单定义了 body.context 中可以注入运行配置的键。
+# 这些值同时写入 configurable(旧版) 和 context(新版)，确保 LangGraph 前后版本兼容。
+# setup_agent 工具通过 ToolRuntime.context 读取 agent_name，如果只写 configurable，
+# LangGraph >= 1.1.9 将无法读取（见 issue #2677）。
+#
 # Whitelist of run-context keys that the langgraph-compat layer forwards from
 # ``body.context`` into the run config. ``config["context"]`` exists in
 # LangGraph >=0.6, but these values must be written to both ``configurable``
@@ -119,6 +142,9 @@ _CONTEXT_CONFIGURABLE_KEYS: frozenset[str] = frozenset(
 )
 
 
+# (学习注释) merge_run_context_overrides — DeerFlow 的核心扩展点
+# body.context 覆盖运行时配置 (model_name, thinking_enabled, agent_name 等)
+# 同时写入 configurable(旧版) + context(新版) 确保 LangGraph 兼容
 def merge_run_context_overrides(config: dict[str, Any], context: Mapping[str, Any] | None) -> None:
     """Merge whitelisted keys from ``body.context`` into both ``config['configurable']``
     and ``config['context']`` so they are visible to legacy configurable readers and
@@ -136,6 +162,9 @@ def merge_run_context_overrides(config: dict[str, Any], context: Mapping[str, An
                 runtime_context.setdefault(key, context[key])
 
 
+# (学习注释) resolve_agent_factory — 所有 assistant_id 映射到 make_lead_agent
+# 自定义 agent 通过 "lead_agent + agent_name 注入" 模式实现
+# 真正的路由: make_lead_agent 内部读取 cfg["agent_name"] 加载 SOUL.md
 def resolve_agent_factory(assistant_id: str | None):
     """Resolve the agent factory callable from config.
 
@@ -150,6 +179,9 @@ def resolve_agent_factory(assistant_id: str | None):
     return make_lead_agent
 
 
+# (学习注释) build_run_config — 构建 LangGraph RunnableConfig
+# 核心: recursion_limit=100 + context(新版)/configurable(旧版) 配置分叉
+# 非默认 assistant_id → 注入 agent_name → make_lead_agent 加载 SOUL.md
 def build_run_config(
     thread_id: str,
     request_config: dict[str, Any] | None,
@@ -221,6 +253,18 @@ def build_run_config(
     return config
 
 
+# ==============================================================================
+# (学习注释) ★ start_run — 核心工厂函数
+# 完成 7 个步骤:
+#   1. create_or_reject() → 创建 RunRecord（含 asyncio.Lock 并发控制）
+#   2. thread_store upsert → 确保线程记录存在
+#   3. resolve_agent_factory() → 获取 make_lead_agent
+#   4. normalize_input() + build_run_config() → 组装 LangGraph 配置
+#   5. merge_run_context_overrides() → 注入自定义上下文
+#   6. asyncio.create_task(run_agent()) → 后台执行
+# ==============================================================================
+
+
 # ---------------------------------------------------------------------------
 # Run lifecycle
 # ---------------------------------------------------------------------------
@@ -249,6 +293,9 @@ async def start_run(
 
     disconnect = DisconnectMode.cancel if body.on_disconnect == "cancel" else DisconnectMode.continue_
 
+    # 【步骤 1】create_or_reject — 原子化创建 RunRecord（asyncio.Lock 保护）
+    # reject → inflight 则抛 ConflictError 409
+    # interrupt/rollback → 取消 inflight 再创建
     try:
         record = await run_mgr.create_or_reject(
             thread_id,
@@ -263,6 +310,7 @@ async def start_run(
     except UnsupportedStrategyError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
 
+    # 【步骤 2】upsert thread_meta — 隐式创建的 thread 也能被检索到
     # Upsert thread metadata so the thread appears in /threads/search,
     # even for threads that were never explicitly created via POST /threads
     # (e.g. stateless runs).
@@ -279,6 +327,7 @@ async def start_run(
     except Exception:
         logger.warning("Failed to upsert thread_meta for %s (non-fatal)", sanitize_log_param(thread_id))
 
+    # 【步骤 3-5】组装组件：agent 工厂 + 输入归一化 + 配置 + 上下文覆盖
     agent_factory = resolve_agent_factory(body.assistant_id)
     graph_input = normalize_input(body.input)
     config = build_run_config(thread_id, body.config, body.metadata, assistant_id=body.assistant_id)
@@ -291,6 +340,9 @@ async def start_run(
 
     stream_modes = normalize_stream_modes(body.stream_mode)
 
+    # 【步骤 6】asyncio.create_task(run_agent()) — 后台启动 agent 执行
+    # run_agent() 在事件循环中异步运行，不阻塞当前请求
+    # 结果通过 StreamBridge 推送给 SSE consumer
     task = asyncio.create_task(
         run_agent(
             bridge,
@@ -315,6 +367,9 @@ async def start_run(
     return record
 
 
+# (学习注释) ★ sse_consumer — SSE 事件流 Consumer (Async Generator)
+# 数据流: Worker → bridge.publish() → MemoryStreamBridge → subscribe() → format_sse() → yield → HTTP
+# 行为: Last-Event-ID 断线重连 | 15s 心跳 | 断开时 cancel/continue 策略
 async def sse_consumer(
     bridge: StreamBridge,
     record: RunRecord,

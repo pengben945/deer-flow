@@ -6,6 +6,14 @@ missing, except ``get_store`` which returns ``None``.
 Initialization is handled directly in ``app.py`` via :class:`AsyncExitStack`.
 """
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ 【依赖注入层】app.state 运行时单例管理                                          ║
+# ║ langgraph_runtime(): AsyncExitStack 有序初始化所有单例                          ║
+# ║ 初始化顺序: StreamBridge → 持久化引擎 → Checkpointer → Store →                 ║
+# ║             RunRepository → RunEventStore → RunManager                         ║
+# ║ get_* 函数族: 路由器通过 request.app.state 获取依赖，缺失返回 503               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Callable
@@ -57,15 +65,19 @@ async def langgraph_runtime(app: FastAPI) -> AsyncGenerator[None, None]:
         if config is None:
             raise RuntimeError("langgraph_runtime() requires app.state.config to be initialized")
 
+        # 【1】StreamBridge: 事件管道（Worker → SSE Consumer），最先初始化
         app.state.stream_bridge = await stack.enter_async_context(make_stream_bridge(config))
 
         # Initialize persistence engine BEFORE checkpointer so that
         # auto-create-database logic runs first (postgres backend).
+        # 【2】持久化引擎：先初始化数据库（PostgreSQL 自动建库）
         await init_engine_from_config(config.database)
 
+        # 【3】Checkpointer: 状态检查点
         app.state.checkpointer = await stack.enter_async_context(make_checkpointer(config))
         app.state.store = await stack.enter_async_context(make_store(config))
 
+        # 【5】初始化仓库层 — 共享 session_factory，减少数据库连接
         # Initialize repositories — one get_session_factory() call for all.
         sf = get_session_factory()
         if sf is not None:
@@ -84,10 +96,12 @@ async def langgraph_runtime(app: FastAPI) -> AsyncGenerator[None, None]:
 
         app.state.thread_store = make_thread_store(sf, app.state.store)
 
+        # 【6】RunEventStore: 事件流存储（config 驱动: DB / JSONL / Memory）
         # Run event store (has its own factory with config-driven backend selection)
         run_events_config = getattr(config, "run_events", None)
         app.state.run_event_store = make_run_event_store(run_events_config)
 
+        # 【7】RunManager: 运行注册表（内存 + 可选 RunStore 持久化）
         # RunManager with store backing for persistence
         app.state.run_manager = RunManager(store=app.state.run_store)
 
@@ -95,6 +109,12 @@ async def langgraph_runtime(app: FastAPI) -> AsyncGenerator[None, None]:
             yield
         finally:
             await close_engine()
+
+
+# ==============================================================================
+# (学习注释) getter 函数族 — 路由器通过 request → app.state.xxx 获取单例
+# _require() 工厂 → 自动生成类型安全的 getter 闭包，缺失返回 503
+# ==============================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -115,11 +135,34 @@ def _require(attr: str, label: str) -> Callable[[Request], T]:
     return dep
 
 
+# (学习注释) get_stream_bridge: 获取 StreamBridge 单例
+# 返回 app.state.stream_bridge — 事件管道（Worker → SSE Consumer）
+# 路由器通过它订阅 SSE 事件流
 get_stream_bridge: Callable[[Request], StreamBridge] = _require("stream_bridge", "Stream bridge")
+
+# (学习注释) get_run_manager: 获取 RunManager 单例
+# 返回 app.state.run_manager — 运行注册表（创建/查询/取消 Run）
+# 路由器通过它创建 RunRecord、查询运行状态、中断执行
 get_run_manager: Callable[[Request], RunManager] = _require("run_manager", "Run manager")
+
+# (学习注释) get_checkpointer: 获取 Checkpointer 单例
+# 返回 app.state.checkpointer — 状态检查点（持久化 agent 运行状态）
+# wait_run 端点用它读取最终 checkpoint；worker 用它做状态持久化和 rollback
 get_checkpointer: Callable[[Request], Checkpointer] = _require("checkpointer", "Checkpointer")
+
+# (学习注释) get_run_event_store: 获取 RunEventStore 单例
+# 返回 app.state.run_event_store — 事件流存储（消息/追踪/错误事件）
+# 消息列表/事件列表端点通过它查询历史数据
 get_run_event_store: Callable[[Request], RunEventStore] = _require("run_event_store", "Run event store")
+
+# (学习注释) get_feedback_repo: 获取 FeedbackRepository 单例
+# 返回 app.state.feedback_repo — 用户反馈存储（点赞/点踩/评论）
+# list_thread_messages 端点用它附着反馈到消息上
 get_feedback_repo: Callable[[Request], FeedbackRepository] = _require("feedback_repo", "Feedback")
+
+# (学习注释) get_run_store: 获取 RunStore 单例
+# 返回 app.state.run_store — Run 元数据持久化存储
+# token_usage 端点用它做 Token 用量聚合查询
 get_run_store: Callable[[Request], RunStore] = _require("run_store", "Run store")
 
 
@@ -136,6 +179,9 @@ def get_thread_store(request: Request) -> ThreadMetaStore:
     return val
 
 
+# (学习注释) get_run_context — 基础设施依赖聚合
+# 将 checkpointer / store / event_store / thread_store 打包为 RunContext
+# 传递给 worker.py 的 run_agent()，避免参数列表增长
 def get_run_context(request: Request) -> RunContext:
     """Build a :class:`RunContext` from ``app.state`` singletons.
 

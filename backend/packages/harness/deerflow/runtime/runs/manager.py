@@ -1,5 +1,17 @@
 """In-memory run registry with optional persistent RunStore backing."""
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ 【Runtime - RunManager】 运行注册表 + 并发控制核心                             ║
+# ║                                                                              ║
+# ║ RunRecord: 一个 Run 的完整数据模型（状态 + 元数据 + asyncio Task 引用）       ║
+# ║ RunManager: 集中管理所有运行记录，asyncio.Lock 保护所有写操作                  ║
+# ║                                                                              ║
+# ║ 核心能力:                                                                     ║
+# ║   - create_or_reject(): 原子化检查+创建，消除 TOCTOU 竞态                     ║
+# ║   - cancel(): abort_event + task.cancel() 双重中断机制                        ║
+# ║   - _persist_to_store(): 可选持久化到 RunStore                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +30,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# (学习注释) RunRecord: 一个 Run 的运行态数据模型
+# task → asyncio.Task 引用，用于 join/cancel
+# abort_event → asyncio.Event，Worker 通过轮询此事件实现优雅中止
+# abort_action → "interrupt" (保留checkpoint) 或 "rollback" (恢复到运行前)
 @dataclass
 class RunRecord:
     """Mutable record for a single run."""
@@ -137,6 +153,12 @@ class RunManager:
                 logger.warning("Failed to persist status update for run %s", run_id, exc_info=True)
         logger.info("Run %s -> %s", run_id, status.value)
 
+    # (学习注释) ★ cancel: 双重中断机制
+    # 1. abort_event.set() → Worker 在 agent.astream() 循环中轮询检查，优雅停止
+    # 2. record.task.cancel() → 强制触发 asyncio.CancelledError
+    # 结合两种机制确保"优雅优先，强制保底"
+    # action=interrupt: 保留 checkpoint（可 resume）
+    # action=rollback: Worker 捕获 CancelledError 后恢复运行前 checkpoint
     async def cancel(self, run_id: str, *, action: str = "interrupt") -> bool:
         """Request cancellation of a run.
 
@@ -162,6 +184,12 @@ class RunManager:
         logger.info("Run %s cancelled (action=%s)", run_id, action)
         return True
 
+    # (学习注释) ★ create_or_reject: 原子化创建 Run（含并发控制核心）
+    # 在 asyncio.Lock 保护下完成:
+    #   1. 检查 thread 是否有 inflight Run
+    #   2. reject 策略 → 存在 inflight 则抛 ConflictError(409)
+    #   3. interrupt/rollback 策略 → 取消 inflight 再创建
+    # 如果没有这个方法，单独 has_inflight + create 存在 TOCTOU 竞态
     async def create_or_reject(
         self,
         thread_id: str,
